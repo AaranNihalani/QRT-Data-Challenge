@@ -495,14 +495,17 @@ def apply_molecular_pca(X_train: pd.DataFrame, X_test: pd.DataFrame, variance: f
     mol_cols = [c for c in X_train.columns if not c.startswith(clin_prefixes)]
     if not mol_cols:
         return X_train, X_test
-    pca = PCA(n_components=None, svd_solver="full")
-    pca.fit(X_train[mol_cols])
-    # Determine number of components to retain desired variance
-    cum = np.cumsum(pca.explained_variance_ratio_)
+    scaler = StandardScaler(with_mean=False)
+    X_train_mol = scaler.fit_transform(X_train[mol_cols])
+    X_test_mol = scaler.transform(X_test[mol_cols])
+
+    pca_full = PCA(n_components=None, svd_solver="full")
+    pca_full.fit(X_train_mol)
+    cum = np.cumsum(pca_full.explained_variance_ratio_)
     k = int(np.searchsorted(cum, variance) + 1)
     pca = PCA(n_components=k, svd_solver="full")
-    Z_train = pca.fit_transform(X_train[mol_cols])
-    Z_test = pca.transform(X_test[mol_cols])
+    Z_train = pca.fit_transform(X_train_mol)
+    Z_test = pca.transform(X_test_mol)
     pc_cols = [f"mol_pca_{i+1}" for i in range(Z_train.shape[1])]
     X_train_out = X_train.drop(columns=mol_cols).copy()
     X_test_out = X_test.drop(columns=mol_cols).copy()
@@ -599,6 +602,8 @@ def oof_predictions_kfold(model_name: str, X: pd.DataFrame, y_df: pd.DataFrame, 
     ids = X.index.astype(str).tolist()
 
     # survival structured array for sksurv
+    if SKSURV_AVAILABLE:
+        y_struct = Surv.from_dataframe("OS_STATUS", "OS_YEARS", y_df.set_index("ID").loc[X.index])
     for fold, (tr_idx, val_idx) in enumerate(kf.split(X, labels)):
         print(f"Fold {fold+1}/{n_splits} for {model_name}")
         X_tr = X.iloc[tr_idx]
@@ -718,7 +723,7 @@ def tune_xgb_survival(X: pd.DataFrame, y_df: pd.DataFrame, n_splits: int = 5, ra
     }
     best_ci = -np.inf
     best_params = {"eta": 0.05, "max_depth": 6, "subsample": 0.85, "colsample_bytree": 0.8, "min_child_weight": 4, "alpha": 0.1, "lambda": 1.0}
-    for trial in range(1, n_trials + 1):
+    for _ in range(n_trials):
         params = best_params.copy()
         params.update({
             "eta": float(rng.uniform(0.02, 0.12)),
@@ -746,7 +751,6 @@ def tune_xgb_survival(X: pd.DataFrame, y_df: pd.DataFrame, n_splits: int = 5, ra
             except Exception:
                 fold_scores.append(0.0)
         mean_ci = float(np.mean(fold_scores)) if fold_scores else -np.inf
-        print(f"  Trial {trial}/{n_trials}: mean c-index {mean_ci:.4f} (best {best_ci:.4f})")
         if mean_ci > best_ci:
             best_ci = mean_ci
             best_params = params.copy()
@@ -786,7 +790,6 @@ def tune_rsf_hyperparameters(X: pd.DataFrame, y_df: pd.DataFrame, n_splits: int 
             except Exception:
                 fold_scores.append(0.0)
         mean_ci = float(np.mean(fold_scores)) if fold_scores else -np.inf
-        print(f"  RSF params {params} -> c-index {mean_ci:.4f}")
         if mean_ci > best_ci:
             best_ci = mean_ci
             best = params
@@ -829,7 +832,6 @@ def tune_gbsa_hyperparameters(X: pd.DataFrame, y_df: pd.DataFrame, n_splits: int
             except Exception:
                 fold_scores.append(0.0)
         mean_ci = float(np.mean(fold_scores)) if fold_scores else -np.inf
-        print(f"  GBSA params {params} -> c-index {mean_ci:.4f}")
         if mean_ci > best_ci:
             best_ci = mean_ci
             best = params
@@ -901,14 +903,12 @@ def train_deepsurv(X_tr: np.ndarray, y_tr_df: pd.DataFrame, X_val: np.ndarray, y
     best_val = float("inf")
     best_state = None
     wait = 0
-    print(f"DeepSurv training: epochs={epochs}, patience={patience}, input_dim={X_tr.shape[1]}")
     for epoch in range(epochs):
         model.train()
         optimizer.zero_grad()
         risk = model(X_tr_t)
         loss = criterion(risk, y_tr_dur, y_tr_evt)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         optimizer.step()
 
         # val
@@ -916,8 +916,6 @@ def train_deepsurv(X_tr: np.ndarray, y_tr_df: pd.DataFrame, X_val: np.ndarray, y
         with torch.no_grad():
             val_risk = model(X_val_t)
             val_loss = criterion(val_risk, y_val_dur, y_val_evt).item()
-        if epoch % 20 == 0 or epoch == epochs - 1:
-            print(f"  epoch {epoch+1}/{epochs} val_loss={val_loss:.4f} best={best_val:.4f}")
         if val_loss < best_val - 1e-6:
             best_val = val_loss
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
@@ -943,20 +941,6 @@ def predict_deepsurv_risk(model: nn.Module, X: np.ndarray) -> np.ndarray:
 
 
 # -----------------------------
-# Helpers
-# -----------------------------
-def _standardize_with_stats(X: np.ndarray, mu: Optional[np.ndarray] = None, sigma: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    array = np.asarray(X, dtype=np.float64)
-    if mu is None:
-        mu = np.nanmean(array, axis=0)
-    if sigma is None:
-        sigma = np.nanstd(array, axis=0)
-    safe_sigma = np.where(np.isfinite(sigma) & (np.abs(sigma) > 1e-6), sigma, 1.0)
-    scaled = (array - mu) / safe_sigma
-    return scaled, mu, safe_sigma
-
-
-# -----------------------------
 # Stacking & ensemble
 # -----------------------------
 
@@ -974,9 +958,9 @@ def stack_and_blend(X_train, X_test, y_train, models_oof_preds: Dict[str, np.nda
 
     meta_cols = [f"m_{safe_name(m)}" for m in model_keys]
 
-    # z-score per column to balance models and reuse stats for test set
-    meta_X, mu, sigma = _standardize_with_stats(meta_X)
-    meta_X_test, _, _ = _standardize_with_stats(meta_X_test, mu=mu, sigma=sigma)
+    # z-score per column to balance models
+    meta_X = (meta_X - meta_X.mean(axis=0)) / (meta_X.std(axis=0) + 1e-8)
+    meta_X_test = (meta_X_test - meta_X.mean(axis=0)) / (meta_X.std(axis=0) + 1e-8)
 
     meta_df = pd.DataFrame(meta_X, index=X_train.index, columns=meta_cols)
     meta_df_test = pd.DataFrame(meta_X_test, index=X_test.index, columns=meta_cols)
@@ -998,16 +982,12 @@ def stack_and_blend(X_train, X_test, y_train, models_oof_preds: Dict[str, np.nda
 
 def rank_normalize(arr: np.ndarray) -> np.ndarray:
     """Monotonic rank-based normalization to [0,1]; preserves concordance."""
-    if len(arr) <= 1:
-        return np.zeros_like(arr)
     ranks = pd.Series(arr).rank(method="average")
-    denom = max(len(arr) - 1, 1)
-    return (ranks.values - 1) / (denom + 1e-8)
+    return (ranks.values - 1) / (len(arr) - 1 + 1e-8)
 
 
-def stabilize_preds(preds: Dict[str, np.ndarray], clip_range: float = 20.0) -> Dict[str, np.ndarray]:
+def stabilize_preds(preds: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
     """Clip extreme values and z-score each prediction vector for numerical stability."""
-    clip_range = max(1.0, float(clip_range))
     out = {}
     for k, v in preds.items():
         arr = np.asarray(v, dtype=np.float64)
@@ -1017,11 +997,8 @@ def stabilize_preds(preds: Dict[str, np.ndarray], clip_range: float = 20.0) -> D
         except Exception:
             lo, hi = arr.min(), arr.max()
         arr = np.clip(arr, lo, hi)
-        arr = np.clip(arr, -clip_range, clip_range)
         mu = arr.mean()
-        sigma = arr.std()
-        if sigma < 1e-6:
-            sigma = 1.0
+        sigma = arr.std() + 1e-8
         out[k] = (arr - mu) / sigma
     return out
 
@@ -1041,20 +1018,9 @@ def main(args):
     if args.gene2path:
         gene2path = json.load(open(args.gene2path))
 
-    folds = 5
-    xgb_trials = 12
-    clip_range = 20.0
-    threads = 4
-    random_state = 42
-    use_deepsurv = TORCH_AVAILABLE
-    if not use_deepsurv:
-        print("PyTorch unavailable; skipping DeepSurv to keep runtime reasonable.")
-
-    print("Stage: Preprocessing clinical inputs...")
     clin_train_proc, preprocessor = build_clinical_preprocessor(clin_train.copy())
     X_train = build_feature_matrix(clin_train_proc, mol_train, preprocessor, top_n_genes=args.top_genes, driver_genes=driver_genes, gene2path=gene2path)
 
-    print("Stage: Processing test clinical data...")
     # prepare test using fitted preprocessor
     ids_test = clin_test["ID"].astype(str).values
     X_clin_test = preprocessor.transform(clin_test)
@@ -1078,7 +1044,6 @@ def main(args):
                 clin_feature_names.extend([f"txt_{t}" for t in tf_names])
 
     X_clin_test_df = pd.DataFrame(X_clin_test, index=ids_test, columns=clin_feature_names)
-    print("Stage: Aggregating molecular features for test data...")
     mol_test_agg = aggregate_molecular(mol_test, top_n_genes=args.top_genes, driver_genes=driver_genes, gene2path=gene2path)
     X_test = X_clin_test_df.join(mol_test_agg, how="left").fillna(0)
 
@@ -1095,9 +1060,9 @@ def main(args):
     X_test_al.index = X_test_al.index.astype(str)
 
     # Fit baseline Cox (full data) for a quick baseline
-    print(f"Stage: Tuning and fitting base Cox model with {folds}-fold CV...")
+    print("Tuning Cox hyperparameters and fitting on full training data...")
     try:
-        best_pen, best_l1 = tune_cox_hyperparameters(X_train_al, y_train, n_splits=folds, random_state=random_state)
+        best_pen, best_l1 = tune_cox_hyperparameters(X_train_al, y_train, n_splits=5)
         cph_full = fit_elastic_cox(X_train_al, y_train, penalizer=best_pen, l1_ratio=best_l1)
         # use log partial hazard (linear predictor) for stable magnitudes
         cph_test_risk = cph_full.predict_log_partial_hazard(X_test_al).values.flatten()
@@ -1114,32 +1079,30 @@ def main(args):
     if SKSURV_AVAILABLE:
         y_struct_full = Surv.from_dataframe("OS_STATUS", "OS_YEARS", y_train.set_index("ID").loc[X_train_al.index])
 
-        print(f"Stage: Tuning RSF and generating OOF with {folds}-fold CV...")
-        rsf_best = tune_rsf_hyperparameters(X_train_al, y_train, n_splits=folds, random_state=random_state)
-        rsf_oof = oof_predictions_kfold("rsf", X_train_al, y_train, n_splits=folds,
-                                        model_params=rsf_best, random_state=random_state, n_threads=threads)
+        print("Tuning RSF and generating OOF...")
+        rsf_best = tune_rsf_hyperparameters(X_train_al, y_train, n_splits=5)
+        rsf_oof = oof_predictions_kfold("rsf", X_train_al, y_train, n_splits=5, model_params=rsf_best)
         oof_preds["rsf"] = rsf_oof
         rsf_full = RandomSurvivalForest(
             n_estimators=rsf_best.get("n_estimators", 900),
             min_samples_leaf=rsf_best.get("min_samples_leaf", 8),
             max_features=rsf_best.get("max_features", "sqrt"),
-            n_jobs=threads,
-            random_state=random_state,
+            n_jobs=-1,
+            random_state=42,
         )
         rsf_full.fit(X_train_al.values, y_struct_full)
         test_preds["rsf"] = -rsf_full.predict(X_test_al.values)
 
-        print(f"Stage: Tuning Gradient Boosting Survival and generating OOF ({folds}-fold CV)...")
-        gbsa_best = tune_gbsa_hyperparameters(X_train_al, y_train, n_splits=folds, random_state=random_state)
-        gbsa_oof = oof_predictions_kfold("gbsa", X_train_al, y_train, n_splits=folds,
-                                         model_params=gbsa_best, random_state=random_state)
+        print("Tuning Gradient Boosting Survival and generating OOF...")
+        gbsa_best = tune_gbsa_hyperparameters(X_train_al, y_train, n_splits=5)
+        gbsa_oof = oof_predictions_kfold("gbsa", X_train_al, y_train, n_splits=5, model_params=gbsa_best)
         oof_preds["gbsa"] = gbsa_oof
         gbsa_full = GradientBoostingSurvivalAnalysis(
             learning_rate=gbsa_best.get("learning_rate", 0.05),
             n_estimators=gbsa_best.get("n_estimators", 600),
             max_depth=gbsa_best.get("max_depth", 2),
             subsample=gbsa_best.get("subsample", 0.9),
-            random_state=random_state,
+            random_state=42,
         )
         gbsa_full.fit(X_train_al.values, y_struct_full)
         test_preds["gbsa"] = -gbsa_full.predict(X_test_al.values)
@@ -1148,22 +1111,14 @@ def main(args):
 
     # XGBoost
     try:
-        print(f"Stage: Tuning XGBoost survival (AFT) with {folds}-fold CV and {xgb_trials} trials...")
-        xgb_best = tune_xgb_survival(
-            X_train_al, y_train, n_splits=folds, random_state=random_state,
-            n_trials=xgb_trials
-        )
-        xgb_oof = oof_predictions_kfold(
-            "xgb", X_train_al, y_train, n_splits=folds,
-            model_params=xgb_best, random_state=random_state, n_threads=threads
-        )
+        print("Tuning XGBoost survival and generating OOF...")
+        xgb_best = tune_xgb_survival(X_train_al, y_train, n_splits=5)
+        xgb_oof = oof_predictions_kfold("xgb", X_train_al, y_train, n_splits=5, model_params=xgb_best)
         oof_preds["xgb"] = xgb_oof
         # full model
         dtrain = build_xgb_aft_dmatrix(X_train_al, y_train)
         dtest = xgb.DMatrix(X_test_al.values)
         params = xgb_best.copy()
-        params.setdefault("nthread", threads)
-        params.setdefault("verbosity", 0)
         num_boost_round = int(params.pop("num_boost_round", 1100))
         bst = xgb.train(params, dtrain, num_boost_round=num_boost_round, verbose_eval=False)
         test_preds["xgb"] = -_predict_xgb_with_best_iteration(bst, dtest)
@@ -1172,36 +1127,26 @@ def main(args):
 
     # Cox OOF with tuned hyperparameters
     try:
-        cox_oof = oof_predictions_kfold("cox", X_train_al, y_train, n_splits=folds,
-                                        model_params={"penalizer": best_pen, "l1_ratio": best_l1},
-                                        random_state=random_state, n_threads=threads)
+        cox_oof = oof_predictions_kfold("cox", X_train_al, y_train, n_splits=5, model_params={"penalizer": best_pen, "l1_ratio": best_l1})
         oof_preds["cox"] = cox_oof
     except Exception:
         oof_preds["cox"] = cph_full.predict_log_partial_hazard(X_train_al).values.flatten()
     test_preds["cox"] = cph_test_risk
 
     # DeepSurv OOF and full prediction
-    if use_deepsurv:
+    try:
         print("Training DeepSurv and generating OOF...")
-        try:
-            ds_params = {"epochs": 200, "lr": 1e-3, "weight_decay": 1e-4, "hidden_dims": [256, 128], "dropout": 0.1, "patience": 20}
-            deepsurv_oof = oof_predictions_kfold("deepsurv", X_train_al, y_train, n_splits=folds,
-                                                 model_params=ds_params, random_state=random_state, n_threads=threads)
-            oof_preds["deepsurv"] = deepsurv_oof
-            y_full_idxed = _get_y_indexed(y_train, X_train_al.index)
-            ds_full = train_deepsurv(X_train_al.values, y_full_idxed, X_train_al.values, y_full_idxed,
-                                     epochs=ds_params["epochs"], lr=ds_params["lr"], weight_decay=ds_params["weight_decay"],
-                                     hidden_dims=ds_params["hidden_dims"], dropout=ds_params["dropout"], patience=ds_params["patience"], device="cpu")
-            test_preds["deepsurv"] = predict_deepsurv_risk(ds_full, X_test_al.values)
-        except Exception as e:
-            print("DeepSurv training failed:", e)
-    else:
-        if args.use_deepsurv and not TORCH_AVAILABLE:
-            print("DeepSurv disabled because PyTorch is unavailable.")
-        elif args.use_deepsurv:
-            print("DeepSurv flag provided but training was skipped; check earlier logs.")
-        else:
-            print("DeepSurv disabled by default; pass --use_deepsurv if you have time and PyTorch.")
+        ds_params = {"epochs": 200, "lr": 1e-3, "weight_decay": 1e-4, "hidden_dims": [256, 128], "dropout": 0.1, "patience": 20}
+        deepsurv_oof = oof_predictions_kfold("deepsurv", X_train_al, y_train, n_splits=5, model_params=ds_params)
+        oof_preds["deepsurv"] = deepsurv_oof
+        # train full DeepSurv on all data, predict test
+        y_full_idxed = _get_y_indexed(y_train, X_train_al.index)
+        ds_full = train_deepsurv(X_train_al.values, y_full_idxed, X_train_al.values, y_full_idxed,
+                                 epochs=ds_params["epochs"], lr=ds_params["lr"], weight_decay=ds_params["weight_decay"],
+                                 hidden_dims=ds_params["hidden_dims"], dropout=ds_params["dropout"], patience=ds_params["patience"], device="cpu")
+        test_preds["deepsurv"] = predict_deepsurv_risk(ds_full, X_test_al.values)
+    except Exception as e:
+        print("DeepSurv training failed:", e)
 
     # Ensure keys consistent
     for k in list(test_preds.keys()):
@@ -1209,11 +1154,10 @@ def main(args):
             print(f"Warning: test_preds length mismatch for {k}")
 
     # Stabilize per-model predictions, then stack and blend
-    oof_preds = stabilize_preds(oof_preds, clip_range=clip_range)
-    test_preds = stabilize_preds(test_preds, clip_range=clip_range)
-    print("Stage: Stacking ensemble models...")
+    oof_preds = stabilize_preds(oof_preds)
+    test_preds = stabilize_preds(test_preds)
+    print("Stacking and blending models...")
     blended = stack_and_blend(X_train_al, X_test_al, y_train, oof_preds, test_preds)
-    blended = np.nan_to_num(blended, neginf=-clip_range, posinf=clip_range)
     # Normalize final risk to avoid huge magnitudes while preserving ranking
     blended = rank_normalize(blended)
 
@@ -1232,12 +1176,6 @@ if __name__ == "__main__":
     parser.add_argument("--top_genes", type=int, default=200)
     parser.add_argument("--driver_genes", type=str, default=None, help="optional path to newline-separated driver genes")
     parser.add_argument("--gene2path", type=str, default=None, help="optional path to gene->pathway JSON mapping")
-    parser.add_argument("--folds", type=int, default=5, help="Number of CV folds for tuning.")
-    parser.add_argument("--xgb_trials", type=int, default=6, help="Random search trials for XGBoost survival.")
-    parser.add_argument("--max_threads", type=int, default=6, help="Maximum threads for CPU-bound learners.")
-    parser.add_argument("--clip_pred", type=float, default=15.0, help="Clip range applied to base model predictions before stacking.")
-    parser.add_argument("--use_deepsurv", action="store_true", help="Enable DeepSurv training (disabled by default on macOS).")
-    parser.add_argument("--random_state", type=int, default=42, help="Random seed for reproducibility.")
     args = parser.parse_args()
 
     main(args)
