@@ -28,7 +28,7 @@ import xgboost as xgb
 
 # sksurv for RSF
 try:
-    from sksurv.ensemble import RandomSurvivalForest
+    from sksurv.ensemble import RandomSurvivalForest, GradientBoostingSurvivalAnalysis
     from sksurv.util import Surv
     SKSURV_AVAILABLE = True
 except Exception:
@@ -515,6 +515,31 @@ def apply_molecular_pca(X_train: pd.DataFrame, X_test: pd.DataFrame, variance: f
 # Models: Cox (lifelines), RSF, XGBoost
 # -----------------------------
 
+def build_xgb_aft_dmatrix(X_slice: pd.DataFrame, y_df: pd.DataFrame) -> xgb.DMatrix:
+    """Construct DMatrix with interval bounds for survival:aft objective."""
+    y_idx = _get_y_indexed(y_df, X_slice.index)
+    durations = y_idx["OS_YEARS"].values.astype(np.float32)
+    durations = np.maximum(durations, 1e-3)
+    events = y_idx["OS_STATUS"].values.astype(int)
+    lower = durations.astype(np.float32)
+    upper = lower.copy()
+    upper[events == 0] = np.inf
+    dmat = xgb.DMatrix(X_slice.values, label=durations)
+    dmat.set_float_info("label_lower_bound", lower)
+    dmat.set_float_info("label_upper_bound", upper)
+    return dmat
+
+
+def _predict_xgb_with_best_iteration(model: xgb.Booster, dmat: xgb.DMatrix) -> np.ndarray:
+    """Predict using the best iteration/ntree if early stopping was used."""
+    best_ntree = getattr(model, "best_ntree_limit", 0)
+    if best_ntree and best_ntree > 0:
+        return model.predict(dmat, ntree_limit=best_ntree)
+    best_iter = getattr(model, "best_iteration", None)
+    if best_iter is not None and best_iter >= 0:
+        return model.predict(dmat, iteration_range=(0, best_iter + 1))
+    return model.predict(dmat)
+
 def fit_elastic_cox(X: pd.DataFrame, y_df: pd.DataFrame, penalizer: float = 0.1, l1_ratio: float = 0.5) -> CoxPHFitter:
     df = X.copy()
     durations, events = _get_duration_event(y_df, df.index)
@@ -565,7 +590,7 @@ def tune_cox_hyperparameters(X: pd.DataFrame, y_df: pd.DataFrame, n_splits: int 
 
 def oof_predictions_kfold(model_name: str, X: pd.DataFrame, y_df: pd.DataFrame, n_splits: int = 5, random_state: int = 42,
                           model_params: Optional[Dict] = None):
-    """Return OOF training predictions using stratified KFold for {cox, rsf, xgb}."""
+    """Return OOF training predictions using stratified KFold for supported survival base learners."""
     labels = _stratify_labels(y_df, X.index)
     kf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
     oof = np.zeros(len(X))
@@ -611,31 +636,52 @@ def oof_predictions_kfold(model_name: str, X: pd.DataFrame, y_df: pd.DataFrame, 
             oof[val_idx] = val_risk
 
         elif model_name == "xgb":
-            # XGBoost survival: train with survival:cox objective; label is duration; events handled via sample weight trick
-            dtrain = xgb.DMatrix(X_tr.values, label=y_tr["OS_YEARS"].values)
-            dval = xgb.DMatrix(X_val.values, label=y_val["OS_YEARS"].values)
-            params = {"objective": "survival:cox", "eval_metric": "cox-nloglik", "eta": 0.05, "max_depth": 6, "subsample": 0.8,
-                      "colsample_bytree": 0.8, "min_child_weight": 4, "alpha": 0.0, "lambda": 1.0}
+            dtrain = build_xgb_aft_dmatrix(X_tr, y_df)
+            dval = build_xgb_aft_dmatrix(X_val, y_df)
+            params = {
+                "objective": "survival:aft",
+                "eval_metric": "aft-nloglik",
+                "aft_loss_distribution": "logistic",
+                "aft_loss_distribution_scale": 1.3,
+                "eta": 0.05,
+                "max_depth": 6,
+                "subsample": 0.85,
+                "colsample_bytree": 0.8,
+                "min_child_weight": 4,
+                "alpha": 0.1,
+                "lambda": 1.0,
+                "tree_method": "hist",
+                "device": "cpu",
+            }
             if model_params is not None:
                 params.update(model_params)
-            # Try to use GPU if XGBoost build supports it (note: on macOS GPU support is limited)
             try:
-                params.update({"tree_method": "hist", "device": "cpu"})
-                print("Using XGBoost CPU mode with tree_method='hist'")
-            except Exception:
-                print("Could not set GPU params for XGBoost; will attempt training and fallback to CPU if it fails")
-
-            # Train with a fallback to CPU if GPU-backed train fails
-            try:
-                bst = xgb.train(params, dtrain, num_boost_round=1000, evals=[(dval, "val")], early_stopping_rounds=50, verbose_eval=False)
+                bst = xgb.train(params, dtrain, num_boost_round=1200, evals=[(dval, "val")], early_stopping_rounds=75, verbose_eval=False)
             except Exception as e:
-                print("XGBoost GPU training failed, retrying on CPU. Error:", e)
-                params_cpu = params.copy()
-                params_cpu.update({"tree_method": "hist", "device": "cpu"})
-                bst = xgb.train(params_cpu, dtrain, num_boost_round=1000, evals=[(dval, "val")], early_stopping_rounds=50, verbose_eval=False)
+                print("XGBoost survival training failed, retrying with conservative params. Error:", e)
+                params_fallback = params.copy()
+                params_fallback["eta"] = 0.03
+                bst = xgb.train(params_fallback, dtrain, num_boost_round=900, evals=[(dval, "val")], early_stopping_rounds=60, verbose_eval=False)
 
-            # return raw margins for stability
-            val_risk = bst.predict(dval, output_margin=True)
+            val_pred = _predict_xgb_with_best_iteration(bst, dval)
+            oof[val_idx] = -val_pred
+
+        elif model_name == "gbsa":
+            if not SKSURV_AVAILABLE:
+                raise RuntimeError("sksurv not available; cannot train GradientBoostingSurvivalAnalysis")
+            gb_params = {"learning_rate": 0.05, "n_estimators": 600, "max_depth": 2, "subsample": 0.9}
+            if model_params is not None:
+                gb_params.update(model_params)
+            y_tr_struct = Surv.from_dataframe("OS_STATUS", "OS_YEARS", y_tr)
+            gbsa = GradientBoostingSurvivalAnalysis(
+                learning_rate=gb_params.get("learning_rate", 0.05),
+                n_estimators=gb_params.get("n_estimators", 600),
+                max_depth=gb_params.get("max_depth", 2),
+                subsample=gb_params.get("subsample", 0.9),
+                random_state=random_state,
+            )
+            gbsa.fit(X_tr.values, y_tr_struct)
+            val_risk = -gbsa.predict(X_val.values)
             oof[val_idx] = val_risk
 
         elif model_name == "deepsurv":
@@ -660,39 +706,44 @@ def oof_predictions_kfold(model_name: str, X: pd.DataFrame, y_df: pd.DataFrame, 
 
 
 def tune_xgb_survival(X: pd.DataFrame, y_df: pd.DataFrame, n_splits: int = 5, random_state: int = 42, n_trials: int = 12) -> Dict:
-    """Randomized search over XGBoost survival params using CV concordance."""
+    """Randomized search over XGBoost survival (AFT) params using CV concordance."""
     rng = np.random.default_rng(random_state)
     labels = _stratify_labels(y_df, X.index)
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
-    base = {"objective": "survival:cox", "eval_metric": "cox-nloglik", "tree_method": "hist", "device": "cpu"}
+    base = {
+        "objective": "survival:aft",
+        "eval_metric": "aft-nloglik",
+        "aft_loss_distribution": "logistic",
+        "aft_loss_distribution_scale": 1.3,
+        "tree_method": "hist",
+        "device": "cpu",
+    }
     best_ci = -np.inf
-    best_params = {"eta": 0.05, "max_depth": 6, "subsample": 0.8, "colsample_bytree": 0.8, "min_child_weight": 4, "alpha": 0.0, "lambda": 1.0}
+    best_params = {"eta": 0.05, "max_depth": 6, "subsample": 0.85, "colsample_bytree": 0.8, "min_child_weight": 4, "alpha": 0.1, "lambda": 1.0}
     for _ in range(n_trials):
         params = best_params.copy()
         params.update({
-            "eta": float(rng.uniform(0.02, 0.15)),
-            "max_depth": int(rng.integers(3, 9)),
+            "eta": float(rng.uniform(0.02, 0.12)),
+            "max_depth": int(rng.integers(3, 8)),
             "min_child_weight": int(rng.integers(1, 9)),
             "subsample": float(rng.uniform(0.6, 1.0)),
             "colsample_bytree": float(rng.uniform(0.5, 1.0)),
-            "alpha": float(rng.uniform(0.0, 5.0)),
-            "lambda": float(rng.uniform(0.0, 5.0)),
+            "alpha": float(rng.uniform(0.0, 3.0)),
+            "lambda": float(rng.uniform(0.5, 5.0)),
         })
         fold_scores = []
         for tr_idx, val_idx in skf.split(X, labels):
             X_tr = X.iloc[tr_idx]
             X_val = X.iloc[val_idx]
-            y_tr = _get_y_indexed(y_df, X_tr.index)
-            y_val = _get_y_indexed(y_df, X_val.index)
-            dtrain = xgb.DMatrix(X_tr.values, label=y_tr["OS_YEARS"].values)
-            dval = xgb.DMatrix(X_val.values, label=y_val["OS_YEARS"].values)
+            dtrain = build_xgb_aft_dmatrix(X_tr, y_df)
+            dval = build_xgb_aft_dmatrix(X_val, y_df)
             full_params = base.copy()
             full_params.update(params)
             try:
-                bst = xgb.train(full_params, dtrain, num_boost_round=600, evals=[(dval, "val")], early_stopping_rounds=50, verbose_eval=False)
-                preds = bst.predict(dval)
+                bst = xgb.train(full_params, dtrain, num_boost_round=700, evals=[(dval, "val")], early_stopping_rounds=60, verbose_eval=False)
+                preds = _predict_xgb_with_best_iteration(bst, dval)
                 durations_val, events_val = _get_duration_event(y_df, X_val.index)
-                ci = concordance_index(durations_val, preds, events_val)
+                ci = concordance_index(durations_val, -preds, events_val)
                 fold_scores.append(ci)
             except Exception:
                 fold_scores.append(0.0)
@@ -700,7 +751,7 @@ def tune_xgb_survival(X: pd.DataFrame, y_df: pd.DataFrame, n_splits: int = 5, ra
         if mean_ci > best_ci:
             best_ci = mean_ci
             best_params = params.copy()
-    best_params.update({"tree_method": "hist", "device": "cpu", "objective": "survival:cox", "eval_metric": "cox-nloglik"})
+    best_params.update(base)
     return best_params
 
 
@@ -730,6 +781,48 @@ def tune_rsf_hyperparameters(X: pd.DataFrame, y_df: pd.DataFrame, n_splits: int 
                                            max_features=params["max_features"], n_jobs=-1, random_state=42)
                 rsf.fit(X_tr.values, y_tr_struct)
                 preds = -rsf.predict(X_val.values)
+                durations_val, events_val = _get_duration_event(y_df, X_val.index)
+                ci = concordance_index(durations_val, preds, events_val)
+                fold_scores.append(ci)
+            except Exception:
+                fold_scores.append(0.0)
+        mean_ci = float(np.mean(fold_scores)) if fold_scores else -np.inf
+        if mean_ci > best_ci:
+            best_ci = mean_ci
+            best = params
+    return best
+
+
+def tune_gbsa_hyperparameters(X: pd.DataFrame, y_df: pd.DataFrame, n_splits: int = 5, random_state: int = 42) -> Dict:
+    """Small grid search for GradientBoostingSurvivalAnalysis."""
+    if not SKSURV_AVAILABLE:
+        return {}
+    labels = _stratify_labels(y_df, X.index)
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    grid = [
+        {"learning_rate": 0.03, "n_estimators": 800, "max_depth": 2, "subsample": 0.9},
+        {"learning_rate": 0.05, "n_estimators": 600, "max_depth": 2, "subsample": 0.8},
+        {"learning_rate": 0.08, "n_estimators": 400, "max_depth": 3, "subsample": 0.7},
+    ]
+    best_ci = -np.inf
+    best = grid[0]
+    for params in grid:
+        fold_scores = []
+        for tr_idx, val_idx in skf.split(X, labels):
+            X_tr = X.iloc[tr_idx]
+            X_val = X.iloc[val_idx]
+            y_tr = _get_y_indexed(y_df, X_tr.index)
+            try:
+                y_tr_struct = Surv.from_dataframe("OS_STATUS", "OS_YEARS", y_tr)
+                gbsa = GradientBoostingSurvivalAnalysis(
+                    learning_rate=params["learning_rate"],
+                    n_estimators=params["n_estimators"],
+                    max_depth=params["max_depth"],
+                    subsample=params["subsample"],
+                    random_state=random_state,
+                )
+                gbsa.fit(X_tr.values, y_tr_struct)
+                preds = -gbsa.predict(X_val.values)
                 durations_val, events_val = _get_duration_event(y_df, X_val.index)
                 ci = concordance_index(durations_val, preds, events_val)
                 fold_scores.append(ci)
@@ -850,15 +943,22 @@ def predict_deepsurv_risk(model: nn.Module, X: np.ndarray) -> np.ndarray:
 
 def stack_and_blend(X_train, X_test, y_train, models_oof_preds: Dict[str, np.ndarray], test_preds_dict: Dict[str, np.ndarray]):
     """Fit a meta-model (elastic-net Cox) on z-scored OOF preds and blend test predictions."""
-    # Build meta X
-    meta_X = np.vstack([models_oof_preds[m] for m in models_oof_preds]).T
-    meta_X_test = np.vstack([test_preds_dict[m] for m in test_preds_dict]).T
+    model_keys = [k for k in models_oof_preds.keys() if k in test_preds_dict]
+    if not model_keys:
+        raise ValueError("No overlapping models between OOF and test predictions for stacking.")
+    missing = set(models_oof_preds.keys()).symmetric_difference(set(test_preds_dict.keys()))
+    if missing:
+        print(f"Warning: dropping models without both OOF and test predictions: {sorted(missing)}")
+    # Build meta X using consistent column order
+    meta_X = np.vstack([models_oof_preds[m] for m in model_keys]).T
+    meta_X_test = np.vstack([test_preds_dict[m] for m in model_keys]).T
+
+    meta_cols = [f"m_{safe_name(m)}" for m in model_keys]
 
     # z-score per column to balance models
     meta_X = (meta_X - meta_X.mean(axis=0)) / (meta_X.std(axis=0) + 1e-8)
     meta_X_test = (meta_X_test - meta_X.mean(axis=0)) / (meta_X.std(axis=0) + 1e-8)
 
-    meta_cols = [f"m_{safe_name(m)}" for m in models_oof_preds.keys()]
     meta_df = pd.DataFrame(meta_X, index=X_train.index, columns=meta_cols)
     meta_df_test = pd.DataFrame(meta_X_test, index=X_test.index, columns=meta_cols)
 
@@ -972,22 +1072,39 @@ def main(args):
     oof_preds = {}
     test_preds = {}
 
-    # RSF
+    # sksurv models (RSF + Gradient Boosting)
     if SKSURV_AVAILABLE:
+        y_struct_full = Surv.from_dataframe("OS_STATUS", "OS_YEARS", y_train.set_index("ID").loc[X_train_al.index])
+
         print("Tuning RSF and generating OOF...")
         rsf_best = tune_rsf_hyperparameters(X_train_al, y_train, n_splits=5)
         rsf_oof = oof_predictions_kfold("rsf", X_train_al, y_train, n_splits=5, model_params=rsf_best)
         oof_preds["rsf"] = rsf_oof
-        # fit full RSF and predict test
-        rsf_full = RandomSurvivalForest(n_estimators=rsf_best.get("n_estimators", 900),
-                                        min_samples_leaf=rsf_best.get("min_samples_leaf", 8),
-                                        max_features=rsf_best.get("max_features", "sqrt"),
-                                        n_jobs=-1, random_state=42)
-        y_struct_full = Surv.from_dataframe("OS_STATUS", "OS_YEARS", y_train.set_index("ID").loc[X_train_al.index])
+        rsf_full = RandomSurvivalForest(
+            n_estimators=rsf_best.get("n_estimators", 900),
+            min_samples_leaf=rsf_best.get("min_samples_leaf", 8),
+            max_features=rsf_best.get("max_features", "sqrt"),
+            n_jobs=-1,
+            random_state=42,
+        )
         rsf_full.fit(X_train_al.values, y_struct_full)
         test_preds["rsf"] = -rsf_full.predict(X_test_al.values)
+
+        print("Tuning Gradient Boosting Survival and generating OOF...")
+        gbsa_best = tune_gbsa_hyperparameters(X_train_al, y_train, n_splits=5)
+        gbsa_oof = oof_predictions_kfold("gbsa", X_train_al, y_train, n_splits=5, model_params=gbsa_best)
+        oof_preds["gbsa"] = gbsa_oof
+        gbsa_full = GradientBoostingSurvivalAnalysis(
+            learning_rate=gbsa_best.get("learning_rate", 0.05),
+            n_estimators=gbsa_best.get("n_estimators", 600),
+            max_depth=gbsa_best.get("max_depth", 2),
+            subsample=gbsa_best.get("subsample", 0.9),
+            random_state=42,
+        )
+        gbsa_full.fit(X_train_al.values, y_struct_full)
+        test_preds["gbsa"] = -gbsa_full.predict(X_test_al.values)
     else:
-        print("sksurv not available: skipping RSF")
+        print("sksurv not available: skipping RSF/GBSA block")
 
     # XGBoost
     try:
@@ -996,12 +1113,12 @@ def main(args):
         xgb_oof = oof_predictions_kfold("xgb", X_train_al, y_train, n_splits=5, model_params=xgb_best)
         oof_preds["xgb"] = xgb_oof
         # full model
-        dtrain = xgb.DMatrix(X_train_al.values, label=_get_y_indexed(y_train, X_train_al.index)["OS_YEARS"].values)
+        dtrain = build_xgb_aft_dmatrix(X_train_al, y_train)
         dtest = xgb.DMatrix(X_test_al.values)
         params = xgb_best.copy()
-        bst = xgb.train(params, dtrain, num_boost_round=800, verbose_eval=False)
-        # return raw margins to avoid large exponentiated values
-        test_preds["xgb"] = bst.predict(dtest, output_margin=True)
+        num_boost_round = int(params.pop("num_boost_round", 1100))
+        bst = xgb.train(params, dtrain, num_boost_round=num_boost_round, verbose_eval=False)
+        test_preds["xgb"] = -_predict_xgb_with_best_iteration(bst, dtest)
     except Exception as e:
         print("XGBoost training failed:", e)
 
