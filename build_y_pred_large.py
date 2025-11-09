@@ -687,20 +687,7 @@ def oof_predictions_kfold(model_name: str, X: pd.DataFrame, y_df: pd.DataFrame, 
             val_risk = -gbsa.predict(X_val.values)
             oof[val_idx] = val_risk
 
-        elif model_name == "deepsurv":
-            if not TORCH_AVAILABLE:
-                raise RuntimeError("PyTorch not available; cannot train DeepSurv")
-            ds_params = {"epochs": 200, "lr": 1e-3, "weight_decay": 1e-4, "hidden_dims": [128, 64], "dropout": 0.1, "patience": 20}
-            if model_params is not None:
-                ds_params.update(model_params)
-            # Align labels to indices
-            y_tr_idxed = _get_y_indexed(y_df, X_tr.index)
-            y_val_idxed = _get_y_indexed(y_df, X_val.index)
-            model = train_deepsurv(X_tr.values, y_tr_idxed, X_val.values, y_val_idxed,
-                                   epochs=ds_params["epochs"], lr=ds_params["lr"], weight_decay=ds_params["weight_decay"],
-                                   hidden_dims=ds_params["hidden_dims"], dropout=ds_params["dropout"], patience=ds_params["patience"], device="cpu")
-            val_risk = predict_deepsurv_risk(model, X_val.values)
-            oof[val_idx] = val_risk
+        # DeepSurv disabled
 
         else:
             raise ValueError("Unknown model_name")
@@ -1136,25 +1123,43 @@ def main(args):
         oof_preds["cox"] = cph_full.predict_log_partial_hazard(X_train_al).values.flatten()
     test_preds["cox"] = cph_test_risk
 
-    # DeepSurv OOF and full prediction
-    try:
-        print("Training DeepSurv and generating OOF...")
-        ds_params = {"epochs": 200, "lr": 1e-3, "weight_decay": 1e-4, "hidden_dims": [256, 128], "dropout": 0.1, "patience": 20}
-        deepsurv_oof = oof_predictions_kfold("deepsurv", X_train_al, y_train, n_splits=5, model_params=ds_params)
-        oof_preds["deepsurv"] = deepsurv_oof
-        # train full DeepSurv on all data, predict test
-        y_full_idxed = _get_y_indexed(y_train, X_train_al.index)
-        ds_full = train_deepsurv(X_train_al.values, y_full_idxed, X_train_al.values, y_full_idxed,
-                                 epochs=ds_params["epochs"], lr=ds_params["lr"], weight_decay=ds_params["weight_decay"],
-                                 hidden_dims=ds_params["hidden_dims"], dropout=ds_params["dropout"], patience=ds_params["patience"], device="cpu")
-        test_preds["deepsurv"] = predict_deepsurv_risk(ds_full, X_test_al.values)
-    except Exception as e:
-        print("DeepSurv training failed:", e)
+    # DeepSurv disabled
 
     # Ensure keys consistent
     for k in list(test_preds.keys()):
         if len(test_preds[k]) != len(X_test_al):
             print(f"Warning: test_preds length mismatch for {k}")
+
+    # Estimate concordance on training using OOF predictions (per model)
+    try:
+        durations = y_train.set_index("ID").loc[X_train_al.index, "OS_YEARS"].values
+        events = y_train.set_index("ID").loc[X_train_al.index, "OS_STATUS"].values.astype(int)
+        for k, preds in oof_preds.items():
+            try:
+                ci = concordance_index(durations, preds, events)
+                print(f"Estimated CV concordance ({k}): {ci:.4f}")
+            except Exception as e:
+                print(f"Failed to compute c-index for {k}: {e}")
+        # Approximate blended concordance by training meta Cox on OOF features
+        model_keys = sorted(set(oof_preds.keys()) & set(test_preds.keys()))
+        if model_keys:
+            meta_X = np.vstack([oof_preds[m] for m in model_keys]).T
+            meta_X = (meta_X - meta_X.mean(axis=0)) / (meta_X.std(axis=0) + 1e-8)
+            meta_cols = [f"m_{safe_name(m)}" for m in model_keys]
+            meta_df = pd.DataFrame(meta_X, index=X_train_al.index, columns=meta_cols)
+            best_pen, best_l1 = tune_cox_hyperparameters(meta_df, y_train, n_splits=5)
+            cph_meta = CoxPHFitter(penalizer=best_pen, l1_ratio=best_l1)
+            meta_df_fit = meta_df.copy()
+            meta_df_fit["duration"] = durations
+            meta_df_fit["event"] = events
+            cph_meta.fit(meta_df_fit, duration_col="duration", event_col="event", show_progress=False)
+            meta_risk = cph_meta.predict_log_partial_hazard(meta_df).values.flatten()
+            ci_blend = concordance_index(durations, meta_risk, events)
+            print(f"Estimated CV concordance (stacked blend, approx): {ci_blend:.4f}")
+        else:
+            print("No overlapping models for stacking; skipping blended concordance estimate.")
+    except Exception as e:
+        print("Failed to estimate concordance:", e)
 
     # Stabilize per-model predictions, then stack and blend
     oof_preds = stabilize_preds(oof_preds)
@@ -1175,7 +1180,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, default=".", help="path to data directory containing X_train, X_test, Y_train.csv")
-    parser.add_argument("--out", type=str, default="Y_pred_deepsurv.csv", help="output predictions CSV")
+    parser.add_argument("--out", type=str, default="Y_pred_large.csv", help="output predictions CSV")
     parser.add_argument("--top_genes", type=int, default=200)
     parser.add_argument("--driver_genes", type=str, default=None, help="optional path to newline-separated driver genes")
     parser.add_argument("--gene2path", type=str, default=None, help="optional path to gene->pathway JSON mapping")

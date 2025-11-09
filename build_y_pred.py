@@ -483,6 +483,36 @@ def main(args):
         if len(test_preds[k]) != len(X_test_al):
             print(f"Warning: test_preds length mismatch for {k}")
 
+    # Report CV concordance (c-index) from OOF predictions per model
+    try:
+        from lifelines.utils import concordance_index
+        durations = y_train.set_index("ID").loc[X_train_al.index, "OS_YEARS"].values
+        events = y_train.set_index("ID").loc[X_train_al.index, "OS_STATUS"].values.astype(int)
+        for k, preds in oof_preds.items():
+            try:
+                ci = concordance_index(durations, preds, events)
+                print(f"Estimated CV concordance ({k}): {ci:.4f}")
+            except Exception as e:
+                print(f"Failed to compute c-index for {k}: {e}")
+        # Approximate blended concordance by training meta Cox on OOF features
+        model_keys = list(oof_preds.keys())
+        if model_keys:
+            meta_X = np.vstack([oof_preds[m] for m in model_keys]).T
+            meta_cols = [f"m_{safe_name(m)}" for m in model_keys]
+            meta_df = pd.DataFrame(meta_X, index=X_train_al.index, columns=meta_cols)
+            cph_meta = CoxPHFitter(penalizer=0.1, l1_ratio=0.5)
+            meta_df_fit = meta_df.copy()
+            meta_df_fit["duration"] = durations
+            meta_df_fit["event"] = events
+            cph_meta.fit(meta_df_fit, duration_col="duration", event_col="event", show_progress=False)
+            meta_risk = cph_meta.predict_partial_hazard(meta_df).values.flatten()
+            ci_blend = concordance_index(durations, meta_risk, events)
+            print(f"Estimated CV concordance (stacked blend, approx): {ci_blend:.4f}")
+        else:
+            print("No OOF predictions available to estimate blended concordance.")
+    except Exception as e:
+        print("Failed to estimate concordance:", e)
+
     # Simple normalized average blending as fallback
     # Normalize OOF per-model, build meta-model via stacking
     print("Stacking and blending models...")
