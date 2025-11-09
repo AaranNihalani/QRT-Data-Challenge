@@ -1023,7 +1023,9 @@ def main(args):
 
     # prepare test using fitted preprocessor
     ids_test = clin_test["ID"].astype(str).values
-    X_clin_test = preprocessor.transform(clin_test)
+    # IMPORTANT: apply the same clinical feature engineering to test before transform
+    clin_test_proc, _ = build_clinical_preprocessor(clin_test.copy())
+    X_clin_test = preprocessor.transform(clin_test_proc)
     if hasattr(X_clin_test, "toarray"):
         X_clin_test = X_clin_test.toarray()
 
