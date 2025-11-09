@@ -694,6 +694,7 @@ def oof_predictions_kfold(model_name: str, X: pd.DataFrame, y_df: pd.DataFrame, 
                 "hidden_dims": [128, 64],
                 "dropout": 0.1,
                 "patience": 20,
+                "seeds": 3,
             }
             if model_params is not None:
                 ds_params.update(model_params)
@@ -720,23 +721,32 @@ def oof_predictions_kfold(model_name: str, X: pd.DataFrame, y_df: pd.DataFrame, 
                 continue
 
             try:
-                mdl = train_deepsurv(
-                    X_tr_f.values,
-                    y_tr_f,
-                    X_val_f.values,
-                    y_val_f,
-                    epochs=int(ds_params.get("epochs", 200)),
-                    lr=float(ds_params.get("lr", 1e-3)),
-                    weight_decay=float(ds_params.get("weight_decay", 1e-4)),
-                    hidden_dims=list(ds_params.get("hidden_dims", [128, 64])),
-                    dropout=float(ds_params.get("dropout", 0.1)),
-                    patience=int(ds_params.get("patience", 20)),
-                    device="cpu",
-                )
-                val_pred = predict_deepsurv_risk(mdl, X_val_f.values)
+                n_seeds = int(ds_params.get("seeds", 3))
+                agg_val = np.zeros(len(X_val_f), dtype=np.float32)
+                for s in range(n_seeds):
+                    try:
+                        torch.manual_seed(42 + s)
+                    except Exception:
+                        pass
+                    mdl = train_deepsurv(
+                        X_tr_f.values,
+                        y_tr_f,
+                        X_val_f.values,
+                        y_val_f,
+                        epochs=int(ds_params.get("epochs", 200)),
+                        lr=float(ds_params.get("lr", 1e-3)),
+                        weight_decay=float(ds_params.get("weight_decay", 1e-4)),
+                        hidden_dims=list(ds_params.get("hidden_dims", [128, 64])),
+                        dropout=float(ds_params.get("dropout", 0.1)),
+                        patience=int(ds_params.get("patience", 20)),
+                        device="cpu",
+                    )
+                    val_pred = predict_deepsurv_risk(mdl, X_val_f.values)
+                    agg_val += val_pred.astype(np.float32)
+                agg_val /= max(n_seeds, 1)
                 # Map filtered val IDs to positions in oof
                 id2pos = {str(i): pos for pos, i in enumerate(X.index)}
-                for rid, p in zip(X_val_f.index.astype(str).tolist(), val_pred):
+                for rid, p in zip(X_val_f.index.astype(str).tolist(), agg_val):
                     pos = id2pos.get(rid)
                     if pos is not None:
                         oof[pos] = float(p)
@@ -751,7 +761,7 @@ def oof_predictions_kfold(model_name: str, X: pd.DataFrame, y_df: pd.DataFrame, 
     return oof
 
 
-def tune_xgb_survival(X: pd.DataFrame, y_df: pd.DataFrame, n_splits: int = 5, random_state: int = 42, n_trials: int = 12) -> Dict:
+def tune_xgb_survival(X: pd.DataFrame, y_df: pd.DataFrame, n_splits: int = 5, random_state: int = 42, n_trials: int = 18) -> Dict:
     """Randomized search over XGBoost survival (AFT) params using CV concordance."""
     rng = np.random.default_rng(random_state)
     labels = _stratify_labels(y_df, X.index)
@@ -811,6 +821,8 @@ def tune_rsf_hyperparameters(X: pd.DataFrame, y_df: pd.DataFrame, n_splits: int 
         {"n_estimators": 600, "min_samples_leaf": 6, "max_features": "sqrt"},
         {"n_estimators": 900, "min_samples_leaf": 8, "max_features": "sqrt"},
         {"n_estimators": 1200, "min_samples_leaf": 12, "max_features": 0.7},
+        {"n_estimators": 1000, "min_samples_leaf": 6, "max_features": 0.8},
+        {"n_estimators": 1200, "min_samples_leaf": 10, "max_features": "sqrt"},
     ]
     best_ci = -np.inf
     best = grid[0]
@@ -849,6 +861,8 @@ def tune_gbsa_hyperparameters(X: pd.DataFrame, y_df: pd.DataFrame, n_splits: int
         {"learning_rate": 0.03, "n_estimators": 800, "max_depth": 2, "subsample": 0.9},
         {"learning_rate": 0.05, "n_estimators": 600, "max_depth": 2, "subsample": 0.8},
         {"learning_rate": 0.08, "n_estimators": 400, "max_depth": 3, "subsample": 0.7},
+        {"learning_rate": 0.04, "n_estimators": 700, "max_depth": 3, "subsample": 0.85},
+        {"learning_rate": 0.06, "n_estimators": 500, "max_depth": 2, "subsample": 0.75},
     ]
     best_ci = -np.inf
     best = grid[0]
@@ -1183,7 +1197,7 @@ def main(args):
     try:
         if TORCH_AVAILABLE:
             print("Generating DeepSurv OOF and full-model predictions...")
-            ds_params = {"epochs": 200, "lr": 1e-3, "weight_decay": 1e-4, "hidden_dims": [128, 64], "dropout": 0.1, "patience": 20}
+            ds_params = {"epochs": 200, "lr": 1e-3, "weight_decay": 1e-4, "hidden_dims": [128, 64], "dropout": 0.1, "patience": 20, "seeds": 3}
             ds_oof = oof_predictions_kfold("deepsurv", X_train_al, y_train, n_splits=5, model_params=ds_params)
             oof_preds["deepsurv"] = ds_oof
             # Full-model: drop NaN labels
@@ -1194,12 +1208,21 @@ def main(args):
             X_full = X_train_al.loc[mask_full]
             y_full = y_full.loc[mask_full]
             if len(X_full) >= 10:
-                ds_model = train_deepsurv(
-                    X_full.values, y_full, X_full.values[: min(len(X_full), 512)], y_full.iloc[: min(len(X_full), 512)],
-                    epochs=ds_params["epochs"], lr=ds_params["lr"], weight_decay=ds_params["weight_decay"],
-                    hidden_dims=ds_params["hidden_dims"], dropout=ds_params["dropout"], patience=ds_params["patience"], device="cpu"
-                )
-                test_preds["deepsurv"] = predict_deepsurv_risk(ds_model, X_test_al.values)
+                n_seeds = int(ds_params.get("seeds", 3))
+                agg_test = np.zeros(len(X_test_al), dtype=np.float32)
+                for s in range(n_seeds):
+                    try:
+                        torch.manual_seed(777 + s)
+                    except Exception:
+                        pass
+                    ds_model = train_deepsurv(
+                        X_full.values, y_full, X_full.values[: min(len(X_full), 512)], y_full.iloc[: min(len(X_full), 512)],
+                        epochs=ds_params["epochs"], lr=ds_params["lr"], weight_decay=ds_params["weight_decay"],
+                        hidden_dims=ds_params["hidden_dims"], dropout=ds_params["dropout"], patience=ds_params["patience"], device="cpu"
+                    )
+                    agg_test += predict_deepsurv_risk(ds_model, X_test_al.values).astype(np.float32)
+                agg_test /= max(n_seeds, 1)
+                test_preds["deepsurv"] = agg_test
             else:
                 print("DeepSurv full-model skipped due to insufficient clean labels.")
         else:
