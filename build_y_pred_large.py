@@ -2,10 +2,7 @@ import argparse
 import json
 import os
 import re
-import sys
-from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
-import time
 
 import numpy as np
 import pandas as pd
@@ -15,8 +12,7 @@ from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import FunctionTransformer, OneHotEncoder, StandardScaler
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.model_selection import KFold, StratifiedKFold
-from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import StratifiedKFold
 
 # survival libs
 from lifelines import CoxPHFitter
@@ -687,7 +683,67 @@ def oof_predictions_kfold(model_name: str, X: pd.DataFrame, y_df: pd.DataFrame, 
             val_risk = -gbsa.predict(X_val.values)
             oof[val_idx] = val_risk
 
-        # DeepSurv disabled
+        elif model_name == "deepsurv":
+            if not TORCH_AVAILABLE:
+                raise RuntimeError("PyTorch not available; cannot use DeepSurv")
+            # Hyperparameters
+            ds_params = {
+                "epochs": 200,
+                "lr": 1e-3,
+                "weight_decay": 1e-4,
+                "hidden_dims": [128, 64],
+                "dropout": 0.1,
+                "patience": 20,
+            }
+            if model_params is not None:
+                ds_params.update(model_params)
+
+            # NaN-safe labels and alignment
+            y_tr = y_tr.copy()
+            y_val = y_val.copy()
+            y_tr["OS_YEARS"] = pd.to_numeric(y_tr["OS_YEARS"], errors="coerce")
+            y_tr["OS_STATUS"] = pd.to_numeric(y_tr["OS_STATUS"], errors="coerce")
+            y_val["OS_YEARS"] = pd.to_numeric(y_val["OS_YEARS"], errors="coerce")
+            y_val["OS_STATUS"] = pd.to_numeric(y_val["OS_STATUS"], errors="coerce")
+
+            tr_mask = (~y_tr["OS_YEARS"].isna()) & (~y_tr["OS_STATUS"].isna())
+            val_mask = (~y_val["OS_YEARS"].isna()) & (~y_val["OS_STATUS"].isna())
+
+            X_tr_f = X_tr.loc[tr_mask]
+            y_tr_f = y_tr.loc[tr_mask]
+            X_val_f = X_val.loc[val_mask]
+            y_val_f = y_val.loc[val_mask]
+
+            if len(X_tr_f) < 5 or len(X_val_f) < 1:
+                # Fallback to zero risk if insufficient data
+                oof[val_idx] = 0.0
+                continue
+
+            try:
+                mdl = train_deepsurv(
+                    X_tr_f.values,
+                    y_tr_f,
+                    X_val_f.values,
+                    y_val_f,
+                    epochs=int(ds_params.get("epochs", 200)),
+                    lr=float(ds_params.get("lr", 1e-3)),
+                    weight_decay=float(ds_params.get("weight_decay", 1e-4)),
+                    hidden_dims=list(ds_params.get("hidden_dims", [128, 64])),
+                    dropout=float(ds_params.get("dropout", 0.1)),
+                    patience=int(ds_params.get("patience", 20)),
+                    device="cpu",
+                )
+                val_pred = predict_deepsurv_risk(mdl, X_val_f.values)
+                # Map filtered val IDs to positions in oof
+                id2pos = {str(i): pos for pos, i in enumerate(X.index)}
+                for rid, p in zip(X_val_f.index.astype(str).tolist(), val_pred):
+                    pos = id2pos.get(rid)
+                    if pos is not None:
+                        oof[pos] = float(p)
+            except Exception as e:
+                print(f"DeepSurv fold {fold+1} failed: {e}")
+                # conservative fallback
+                oof[val_idx] = 0.0
 
         else:
             raise ValueError("Unknown model_name")
@@ -1123,7 +1179,33 @@ def main(args):
         oof_preds["cox"] = cph_full.predict_log_partial_hazard(X_train_al).values.flatten()
     test_preds["cox"] = cph_test_risk
 
-    # DeepSurv disabled
+    # DeepSurv: OOF and full-model test predictions
+    try:
+        if TORCH_AVAILABLE:
+            print("Generating DeepSurv OOF and full-model predictions...")
+            ds_params = {"epochs": 200, "lr": 1e-3, "weight_decay": 1e-4, "hidden_dims": [128, 64], "dropout": 0.1, "patience": 20}
+            ds_oof = oof_predictions_kfold("deepsurv", X_train_al, y_train, n_splits=5, model_params=ds_params)
+            oof_preds["deepsurv"] = ds_oof
+            # Full-model: drop NaN labels
+            y_full = y_train.set_index("ID").loc[X_train_al.index].copy()
+            y_full["OS_YEARS"] = pd.to_numeric(y_full["OS_YEARS"], errors="coerce")
+            y_full["OS_STATUS"] = pd.to_numeric(y_full["OS_STATUS"], errors="coerce")
+            mask_full = (~y_full["OS_YEARS"].isna()) & (~y_full["OS_STATUS"].isna())
+            X_full = X_train_al.loc[mask_full]
+            y_full = y_full.loc[mask_full]
+            if len(X_full) >= 10:
+                ds_model = train_deepsurv(
+                    X_full.values, y_full, X_full.values[: min(len(X_full), 512)], y_full.iloc[: min(len(X_full), 512)],
+                    epochs=ds_params["epochs"], lr=ds_params["lr"], weight_decay=ds_params["weight_decay"],
+                    hidden_dims=ds_params["hidden_dims"], dropout=ds_params["dropout"], patience=ds_params["patience"], device="cpu"
+                )
+                test_preds["deepsurv"] = predict_deepsurv_risk(ds_model, X_test_al.values)
+            else:
+                print("DeepSurv full-model skipped due to insufficient clean labels.")
+        else:
+            print("PyTorch not available: skipping DeepSurv block")
+    except Exception as e:
+        print("DeepSurv block failed:", e)
 
     # Ensure keys consistent
     for k in list(test_preds.keys()):
