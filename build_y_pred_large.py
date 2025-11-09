@@ -904,6 +904,7 @@ def train_deepsurv(X_tr: np.ndarray, y_tr_df: pd.DataFrame, X_val: np.ndarray, y
     best_state = None
     wait = 0
     for epoch in range(epochs):
+        print(f"Epoch: {epoch+1}/{epochs}")
         model.train()
         optimizer.zero_grad()
         risk = model(X_tr_t)
