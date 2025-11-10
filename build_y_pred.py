@@ -315,26 +315,7 @@ def oof_predictions_kfold(model_name: str, X: pd.DataFrame, y_df: pd.DataFrame, 
             val_risk = bst.predict(dval)
             oof[val_idx] = val_risk
 
-        elif model_name == "deepsurv":
-            if not TORCH_AVAILABLE:
-                raise RuntimeError("PyTorch not available for DeepSurv")
-
-            # CPU only
-            model = DeepSurvModel(input_dim=X_tr.shape[1])
-            model = train_deepsurv(
-                model,
-                X_tr.values.astype(np.float32),
-                y_tr,
-                X_val.values.astype(np.float32),
-                y_val,
-                device=torch.device("cpu"),  # force CPU
-                epochs=5,                    # small for test
-                batch_size=16,
-                patience=2,
-                verbose=True
-            )
-            val_risk = predict_deepsurv_risk(model, X_val.values.astype(np.float32), device=torch.device("cpu"))
-            oof[val_idx] = val_risk
+        # DeepSurv disabled per user request
 
 
         else:
